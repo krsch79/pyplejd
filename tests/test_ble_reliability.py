@@ -36,6 +36,8 @@ class Manager:
         self.button_events_enabled = False
         self.reconnect_after_control_write = True
         self.control_confirmation_timeout = 0
+        self.reauthenticate_before_reconnect = False
+        self.reauth_confirmation_timeout = 1
         self.control_write_flush_delay = 0
         self.connect_callback = Mock()
         self.lastdata_callback = AsyncMock()
@@ -169,6 +171,37 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
         reconnect.assert_not_awaited()
         self.assertEqual(self.mesh.diagnostics["control_confirmations"], 1)
         self.assertEqual(self.mesh.diagnostics["confirmation_timeouts"], 0)
+
+    async def test_in_place_reauthentication_can_confirm_without_reconnect(self):
+        node = make_node(device_addresses=(1,))
+        self.mesh._gateway_node = node
+        self.mesh._client = FakeClient()
+        self.manager.reauthenticate_before_reconnect = True
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        async def reauthenticate_and_confirm():
+            self.mesh._resolve_control_confirmation(2, True)
+            return True
+
+        with (
+            patch.object(self.mesh, "_write", new=AsyncMock(return_value=True)),
+            patch.object(
+                self.mesh,
+                "_reauthenticate_current_client",
+                new=AsyncMock(side_effect=reauthenticate_and_confirm),
+            ) as reauthenticate,
+            patch.object(self.mesh, "_reconnect", new=AsyncMock(return_value=True)) as reconnect,
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        reauthenticate.assert_awaited_once()
+        reconnect.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["in_place_reauth_attempts"], 1)
+        self.assertEqual(self.mesh.diagnostics["in_place_reauth_successes"], 1)
 
     async def test_gateway_control_write_does_not_reconnect(self):
         node = make_node(device_addresses=(1,))

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.3.post4 - 2026-08-21
+
+- Try a fresh Plejd authentication challenge on the existing BLE connection
+  after an unconfirmed mesh command.
+- Poll and accept a matching state update after in-place reauthentication.
+- Preserve the full disconnect/reconnect as the final fallback and expose
+  reauthentication attempt/success counters in diagnostics.
+
 ## 0.21.3.post3 - 2026-08-21
 
 - Wait up to 1.5 seconds for a matching state confirmation after a command to

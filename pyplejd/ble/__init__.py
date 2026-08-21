@@ -68,6 +68,8 @@ class PlejdMesh:
         self._write_retries = 0
         self._control_confirmations = 0
         self._confirmation_timeouts = 0
+        self._in_place_reauth_attempts = 0
+        self._in_place_reauth_successes = 0
         self._suppress_disconnect_notification = False
         self._control_confirmation = None
 
@@ -89,6 +91,8 @@ class PlejdMesh:
             "write_retries": self._write_retries,
             "control_confirmations": self._control_confirmations,
             "confirmation_timeouts": self._confirmation_timeouts,
+            "in_place_reauth_attempts": self._in_place_reauth_attempts,
+            "in_place_reauth_successes": self._in_place_reauth_successes,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -373,6 +377,28 @@ class PlejdMesh:
                         except asyncio.TimeoutError:
                             self._confirmation_timeouts += 1
 
+                        if getattr(
+                            self.manager,
+                            "reauthenticate_before_reconnect",
+                            True,
+                        ):
+                            self._in_place_reauth_attempts += 1
+                            if await self._reauthenticate_current_client():
+                                try:
+                                    await asyncio.wait_for(
+                                        asyncio.shield(confirmation),
+                                        timeout=getattr(
+                                            self.manager,
+                                            "reauth_confirmation_timeout",
+                                            1.0,
+                                        ),
+                                    )
+                                    self._control_confirmations += 1
+                                    self._in_place_reauth_successes += 1
+                                    return True
+                                except asyncio.TimeoutError:
+                                    pass
+
                     # Firmware 6.43.x can buffer a command to a non-gateway node
                     # until the authenticated BLE session is closed. Reconnect only
                     # when no matching state confirmation arrived in time.
@@ -468,6 +494,16 @@ class PlejdMesh:
     async def _reconnect(self, preserve_availability: bool = False):
         await self.disconnect(preserve_availability=preserve_availability)
         return await self.connect()
+
+    async def _reauthenticate_current_client(self):
+        async with self._ble_lock:
+            if not self.connected:
+                return False
+            client = self._client
+            if not await self._authenticate(client):
+                return False
+        await self.poll()
+        return True
 
     async def _write(self, payloads):
         if not self.connected:
