@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.3.post3 - 2026-08-21
+
+- Wait up to 1.5 seconds for a matching state confirmation after a command to
+  a non-gateway node.
+- Skip the reconnect when that confirmation arrives; retain the proven
+  reconnect-and-flush fallback only for unconfirmed commands.
+- Count confirmations and timeouts in the non-secret reliability diagnostics.
+
 ## 0.21.3.post2 - 2026-08-21
 
 - Authenticate the first BLE connection directly and retain the five-second

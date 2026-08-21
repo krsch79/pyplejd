@@ -35,6 +35,7 @@ class Manager:
     def __init__(self):
         self.button_events_enabled = False
         self.reconnect_after_control_write = True
+        self.control_confirmation_timeout = 0
         self.control_write_flush_delay = 0
         self.connect_callback = Mock()
         self.lastdata_callback = AsyncMock()
@@ -143,6 +144,31 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         reconnect.assert_awaited_once_with(preserve_availability=True)
         self.assertEqual(self.mesh.diagnostics["command_reconnects"], 1)
+
+    async def test_confirmed_non_gateway_write_skips_reconnect(self):
+        node = make_node(device_addresses=(1,))
+        self.mesh._gateway_node = node
+        self.mesh._client = FakeClient()
+        self.manager.control_confirmation_timeout = 1
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        async def write_and_confirm(_payloads):
+            self.mesh._resolve_control_confirmation(2, True)
+            return True
+
+        with (
+            patch.object(self.mesh, "_write", new=AsyncMock(side_effect=write_and_confirm)),
+            patch.object(self.mesh, "_reconnect", new=AsyncMock(return_value=True)) as reconnect,
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        reconnect.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["control_confirmations"], 1)
+        self.assertEqual(self.mesh.diagnostics["confirmation_timeouts"], 0)
 
     async def test_gateway_control_write_does_not_reconnect(self):
         node = make_node(device_addresses=(1,))

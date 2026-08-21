@@ -66,7 +66,10 @@ class PlejdMesh:
         self._fallback_auth_attempts = 0
         self._command_reconnects = 0
         self._write_retries = 0
+        self._control_confirmations = 0
+        self._confirmation_timeouts = 0
         self._suppress_disconnect_notification = False
+        self._control_confirmation = None
 
     @property
     def connected(self):
@@ -84,6 +87,8 @@ class PlejdMesh:
             "fallback_auth_attempts": self._fallback_auth_attempts,
             "command_reconnects": self._command_reconnects,
             "write_retries": self._write_retries,
+            "control_confirmations": self._control_confirmations,
+            "confirmation_timeouts": self._confirmation_timeouts,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -160,6 +165,14 @@ class PlejdMesh:
 
                 ld = LastData(data)
                 rec_log(f"lastdata {ld}")
+                if ld.command in {
+                    LastData.CMD_GROUP_OUTPUT_STATE,
+                    LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
+                    LastData.CMD_OUTPUT_STATE_AND_LEVEL,
+                } and ld.payload:
+                    self._resolve_control_confirmation(
+                        ld.address, bool(ld.payload[0])
+                    )
                 await self.manager.lastdata_callback(ld)
 
                 if ld.command == LastData.CMD_EVENT_FIRED and getattr(
@@ -173,7 +186,10 @@ class PlejdMesh:
                     return
 
                 rec_log(f"lightlevel {lightlevel}")
-                await self.manager.lightlevel_callback(parse_lightlevels(lightlevel))
+                levels = parse_lightlevels(lightlevel)
+                for level in levels:
+                    self._resolve_control_confirmation(level.address, level.state)
+                await self.manager.lightlevel_callback(levels)
 
             # Try to connect to nodes in order of decreasing RSSI
             filtered_nodes = filter(
@@ -305,31 +321,72 @@ class PlejdMesh:
             if not self.connected and not await self.connect():
                 return False
             control_write = self._is_non_gateway_control_write(raw_payloads)
+            confirmation = (
+                self._start_control_confirmation(raw_payloads)
+                if control_write
+                and getattr(self.manager, "reconnect_after_control_write", False)
+                else None
+            )
 
-            _LOGGER.debug(f"Write: {payloads}")
-            success = await self._write(self._encrypt_payloads(raw_payloads))
-
-            if not success:
-                self._write_retries += 1
-                _LOGGER.warning("Retrying Plejd write after reconnect")
-                if not await self._reconnect():
-                    return False
+            try:
+                _LOGGER.debug(f"Write: {payloads}")
                 success = await self._write(self._encrypt_payloads(raw_payloads))
 
-            if (
-                success
-                and control_write
-                and getattr(self.manager, "reconnect_after_control_write", False)
-            ):
-                # With Plejd firmware 6.43.x, commands to non-gateway nodes may be
-                # buffered until the authenticated BLE session is closed.
-                await asyncio.sleep(
-                    getattr(self.manager, "control_write_flush_delay", 0.12)
-                )
-                self._command_reconnects += 1
-                success = await self._reconnect(preserve_availability=True)
+                if not success:
+                    self._clear_control_confirmation(confirmation)
+                    confirmation = None
+                    self._write_retries += 1
+                    _LOGGER.warning("Retrying Plejd write after reconnect")
+                    if not await self._reconnect():
+                        return False
+                    confirmation = (
+                        self._start_control_confirmation(raw_payloads)
+                        if control_write
+                        and getattr(
+                            self.manager, "reconnect_after_control_write", False
+                        )
+                        else None
+                    )
+                    success = await self._write(
+                        self._encrypt_payloads(raw_payloads)
+                    )
 
-            return success
+                if (
+                    success
+                    and control_write
+                    and getattr(
+                        self.manager, "reconnect_after_control_write", False
+                    )
+                ):
+                    if confirmation is not None:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(confirmation),
+                                timeout=getattr(
+                                    self.manager,
+                                    "control_confirmation_timeout",
+                                    1.5,
+                                ),
+                            )
+                            self._control_confirmations += 1
+                            return True
+                        except asyncio.TimeoutError:
+                            self._confirmation_timeouts += 1
+
+                    # Firmware 6.43.x can buffer a command to a non-gateway node
+                    # until the authenticated BLE session is closed. Reconnect only
+                    # when no matching state confirmation arrived in time.
+                    await asyncio.sleep(
+                        getattr(self.manager, "control_write_flush_delay", 0.05)
+                    )
+                    self._command_reconnects += 1
+                    success = await self._reconnect(
+                        preserve_availability=True
+                    )
+
+                return success
+            finally:
+                self._clear_control_confirmation(confirmation)
 
     def _encrypt_payloads(self, raw_payloads):
         return [
@@ -368,6 +425,45 @@ class PlejdMesh:
             command.address == 0 or command.address not in gateway_addresses
             for command in controls
         )
+
+    def _start_control_confirmation(self, raw_payloads):
+        state_commands = {
+            LastData.CMD_GROUP_OUTPUT_STATE,
+            LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
+            LastData.CMD_OUTPUT_STATE_AND_LEVEL,
+        }
+        for raw_payload in raw_payloads:
+            command = LastData(raw_payload)
+            if command.command in state_commands and command.payload:
+                future = asyncio.get_running_loop().create_future()
+                self._control_confirmation = (
+                    command.address,
+                    bool(command.payload[0]),
+                    future,
+                )
+                return future
+        return None
+
+    def _resolve_control_confirmation(self, address: int, state: bool):
+        confirmation = self._control_confirmation
+        if confirmation is None:
+            return
+        expected_address, expected_state, future = confirmation
+        if (
+            address == expected_address
+            and bool(state) == expected_state
+            and not future.done()
+        ):
+            future.set_result(True)
+
+    def _clear_control_confirmation(self, future):
+        if future is None:
+            return
+        confirmation = self._control_confirmation
+        if confirmation is not None and confirmation[2] is future:
+            self._control_confirmation = None
+        if not future.done():
+            future.cancel()
 
     async def _reconnect(self, preserve_availability: bool = False):
         await self.disconnect(preserve_availability=preserve_availability)

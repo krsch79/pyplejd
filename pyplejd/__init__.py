@@ -51,7 +51,8 @@ class PlejdManager:
         self.connection_monitor = None
         self.button_events_enabled = True
         self.reconnect_after_control_write = False
-        self.control_write_flush_delay = 0.12
+        self.control_confirmation_timeout = 1.5
+        self.control_write_flush_delay = 0.05
 
     @property
     def blacklist(self):
