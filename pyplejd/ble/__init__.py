@@ -58,10 +58,35 @@ class PlejdMesh:
         self._client: BleakClient = None
 
         self._ble_lock = asyncio.Lock()
+        self._connect_lock = asyncio.Lock()
+        self._command_lock = asyncio.Lock()
+
+        self._connection_attempts = 0
+        self._direct_auth_successes = 0
+        self._fallback_auth_attempts = 0
+        self._command_reconnects = 0
+        self._write_retries = 0
 
     @property
     def connected(self):
-        return self._client is not None
+        return self._client is not None and bool(
+            getattr(self._client, "is_connected", False)
+        )
+
+    @property
+    def diagnostics(self):
+        return {
+            "connected": self.connected,
+            "gateway": self._gateway_node.BLEaddress if self._gateway_node else None,
+            "connection_attempts": self._connection_attempts,
+            "direct_auth_successes": self._direct_auth_successes,
+            "fallback_auth_attempts": self._fallback_auth_attempts,
+            "command_reconnects": self._command_reconnects,
+            "write_retries": self._write_retries,
+            "button_polling": bool(
+                getattr(self.manager, "button_events_enabled", True)
+            ),
+        }
 
     def expect_device(self, node: MeshDevice = None):
         self._mesh_devices[node.BLEaddress] = node
@@ -77,116 +102,144 @@ class PlejdMesh:
         self._crypto_key = key
 
     async def disconnect(self):
-        if not self.connected:
+        client = self._client
+        if client is None:
             return False
 
         try:
-            await self._client.stop_notify(gatt.PLEJD_LASTDATA)
-            await self._client.stop_notify(gatt.PLEJD_LIGHTLEVEL)
-            await self._client.disconnect()
+            if getattr(client, "is_connected", False):
+                await client.stop_notify(gatt.PLEJD_LASTDATA)
+                await client.stop_notify(gatt.PLEJD_LIGHTLEVEL)
+                await client.disconnect()
         except BleakError:
             pass
+        finally:
+            self._mark_disconnected(client)
+        return True
 
+    def _mark_disconnected(self, client: BleakClient | None = None):
+        """Clear connection state without letting an old callback clear a new client."""
+        if client is not None and self._client not in (None, client):
+            return
+        if self._client is None and self._gateway_node is None:
+            return
         self._client = None
+        if self._gateway_node:
+            self._gateway_node.is_gateway = False
+            self._gateway_node.update()
+            self._gateway_node = None
         self.manager.connect_callback(False)
 
     async def connect(self):
-        if self.connected:
-            return True
-        _CONNECTION_LOG.debug("Trying to connect to BLE mesh")
+        async with self._connect_lock:
+            if self.connected:
+                return True
+            if self._client is not None:
+                await self.disconnect()
+            _CONNECTION_LOG.debug("Trying to connect to BLE mesh")
 
-        def _disconnect(client: BleakClient):
-            _CONNECTION_LOG.debug("Disconected from BLE mesh (%s)", client)
-            self._client = None
-            if self._gateway_node:
-                self._gateway_node.is_gateway = False
-                self._gateway_node.update()
-                self._gateway_node = None
-            self.manager.connect_callback(False)
+            def _disconnect(client: BleakClient):
+                _CONNECTION_LOG.debug("Disconnected from BLE mesh (%s)", client)
+                self._mark_disconnected(client)
 
-        # Try to connect to nodes in order of decreasing RSSI
-        filtered_nodes = filter(
-            lambda n: n.connectable and n.rssi is not None,
-            self._mesh_devices.values(),
-        )
-        sorted_nodes = sorted(filtered_nodes, key=lambda n: n.rssi, reverse=True)
+            async def _lastdata_listener(_arg, lastdata: bytearray):
+                if not self.connected:
+                    return
 
-        if not sorted_nodes:
-            return False
-        client = None
-        for node in sorted_nodes:
-            try:
-                _CONNECTION_LOG.debug("Attempting to connect to %s", node)
-                client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    node.bleDevice,
-                    node.bleDevice.name,
-                    max_attempts=2,
+                data = encrypt_decrypt(
+                    self._crypto_key, self._gateway_node.BLEaddress, lastdata
                 )
 
-                # Workaround for problem in plejd firmware 2026-05-20
-                # Disconnect and connect again
-                _CONNECTION_LOG.debug(
-                    "BT Proxy workaround - Disconnecting for 5 seconds."
-                )
-                await client.disconnect()
-                await asyncio.sleep(5)
-                _CONNECTION_LOG.debug("BT Proxy workaround - Reconnecting")
-                client = await establish_connection(
-                    BleakClientWithServiceCache,
-                    node.bleDevice,
-                    node.bleDevice.name,
-                    _disconnect,
-                )
+                ld = LastData(data)
+                rec_log(f"lastdata {ld}")
+                await self.manager.lastdata_callback(ld)
 
-                if not await self._authenticate(client):
-                    await client.disconnect()
-                    continue
-                self._gateway_node = node
-                node.is_gateway = True
-                self._gateway_node.update()
-                break
+                if ld.command == LastData.CMD_EVENT_FIRED and getattr(
+                    self.manager, "button_events_enabled", True
+                ):
+                    await self.poll_buttons()
+                return True
 
-            except (BleakError, asyncio.TimeoutError) as e:
-                _CONNECTION_LOG.warning("Failed to connect to %s: %s", node, str(e))
+            async def _lightlevel_listener(_, lightlevel: bytearray):
+                if not self.connected:
+                    return
 
-        else:
-            _CONNECTION_LOG.warning(
-                "Failed to connect to plejd mesh - %s", sorted_nodes
+                rec_log(f"lightlevel {lightlevel}")
+                await self.manager.lightlevel_callback(parse_lightlevels(lightlevel))
+
+            # Try to connect to nodes in order of decreasing RSSI
+            filtered_nodes = filter(
+                lambda n: n.connectable and n.rssi is not None,
+                self._mesh_devices.values(),
             )
-            return False
+            sorted_nodes = sorted(filtered_nodes, key=lambda n: n.rssi, reverse=True)
 
-        async def _lastdata_listener(_arg, lastdata: bytearray):
-            if not self.connected:
-                return
+            if not sorted_nodes:
+                return False
+            client = None
+            for node in sorted_nodes:
+                try:
+                    self._connection_attempts += 1
+                    _CONNECTION_LOG.debug("Attempting direct connection to %s", node)
+                    client = await establish_connection(
+                        BleakClientWithServiceCache,
+                        node.bleDevice,
+                        node.bleDevice.name,
+                        max_attempts=2,
+                    )
+                    client.set_disconnected_callback(_disconnect)
 
-            data = encrypt_decrypt(
-                self._crypto_key, self._gateway_node.BLEaddress, lastdata
-            )
+                    if await self._authenticate(client):
+                        self._direct_auth_successes += 1
+                    else:
+                        # Some firmware still needs the old double-connect workaround.
+                        self._fallback_auth_attempts += 1
+                        _CONNECTION_LOG.debug(
+                            "Direct authentication failed; retrying after 5 seconds"
+                        )
+                        await client.disconnect()
+                        await asyncio.sleep(5)
+                        client = await establish_connection(
+                            BleakClientWithServiceCache,
+                            node.bleDevice,
+                            node.bleDevice.name,
+                            _disconnect,
+                        )
+                        if not await self._authenticate(client):
+                            await client.disconnect()
+                            continue
 
-            ld = LastData(data)
-            rec_log(f"lastdata {ld}")
-            await self.manager.lastdata_callback(ld)
+                    self._gateway_node = node
+                    node.is_gateway = True
+                    self._gateway_node.update()
+                    self._client = client
+                    await client.start_notify(
+                        gatt.PLEJD_LASTDATA, _lastdata_listener
+                    )
+                    await client.start_notify(
+                        gatt.PLEJD_LIGHTLEVEL, _lightlevel_listener
+                    )
+                    self.manager.connect_callback(True)
+                    await self.poll()
+                    return True
 
-            if ld.command == LastData.CMD_EVENT_FIRED:
-                await self.poll_buttons()
-            return True
+                except (BleakError, asyncio.TimeoutError) as e:
+                    _CONNECTION_LOG.warning(
+                        "Failed to connect to %s: %s", node, str(e)
+                    )
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except BleakError:
+                            pass
+                        finally:
+                            self._mark_disconnected(client)
 
-        async def _lightlevel_listener(_, lightlevel: bytearray):
-            if not self.connected:
-                return
-
-            rec_log(f"lightlevel {lightlevel}")
-            await self.manager.lightlevel_callback(parse_lightlevels(lightlevel))
-
-        await client.start_notify(gatt.PLEJD_LASTDATA, _lastdata_listener)
-        await client.start_notify(gatt.PLEJD_LIGHTLEVEL, _lightlevel_listener)
-        self._client = client
-
-        self.manager.connect_callback(True)
-
-        await self.poll()
-        return True
+            else:
+                _CONNECTION_LOG.warning(
+                    "Failed to connect to plejd mesh - %s", sorted_nodes
+                )
+                return False
 
     async def poll(self):
         if not self.connected:
@@ -205,10 +258,12 @@ class PlejdMesh:
             if not await self.connect():
                 return False
             if not await self._ping(self._client):
+                await self.disconnect()
                 return False
 
         await self.poll()
-        await self.poll_buttons()
+        if getattr(self.manager, "button_events_enabled", True):
+            await self.poll_buttons()
         return True
 
     async def poll_time(self, address: int):
@@ -234,19 +289,81 @@ class PlejdMesh:
         await self.write(payloads)
 
     async def write(self, *payloads: list[str]):
-        if not self.connected:
-            return
+        raw_payloads = [
+            binascii.a2b_hex(payload.replace(" ", "")) for payload in payloads
+        ]
 
-        pl = [
+        async with self._command_lock:
+            if not self.connected and not await self.connect():
+                return False
+            control_write = self._is_non_gateway_control_write(raw_payloads)
+
+            _LOGGER.debug(f"Write: {payloads}")
+            success = await self._write(self._encrypt_payloads(raw_payloads))
+
+            if not success:
+                self._write_retries += 1
+                _LOGGER.warning("Retrying Plejd write after reconnect")
+                if not await self._reconnect():
+                    return False
+                success = await self._write(self._encrypt_payloads(raw_payloads))
+
+            if (
+                success
+                and control_write
+                and getattr(self.manager, "reconnect_after_control_write", False)
+            ):
+                # With Plejd firmware 6.43.x, commands to non-gateway nodes may be
+                # buffered until the authenticated BLE session is closed.
+                await asyncio.sleep(
+                    getattr(self.manager, "control_write_flush_delay", 0.12)
+                )
+                self._command_reconnects += 1
+                success = await self._reconnect()
+
+            return success
+
+    def _encrypt_payloads(self, raw_payloads):
+        return [
             encrypt_decrypt(
                 self._crypto_key,
                 self._gateway_node.BLEaddress,
-                binascii.a2b_hex(payload.replace(" ", "")),
+                payload,
             )
-            for payload in payloads
+            for payload in raw_payloads
         ]
-        _LOGGER.debug(f"Write: {payloads}")
-        await self._write(pl)
+
+    def _is_non_gateway_control_write(self, raw_payloads) -> bool:
+        control_commands = {
+            LastData.CMD_SCENE,
+            LastData.CMD_GROUP_OUTPUT_STATE,
+            LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
+            LastData.CMD_OUTPUT_STATE_AND_LEVEL,
+            LastData.CMD_OUTPUT_SET,
+            LastData.CMD_TUNABLE_WHITE_TEMPERATURE,
+            LastData.CMD_TRM_TEMPERATURE_REGULATING_SETPOINT,
+            LastData.CMD_TRM_OPERATING_MODE,
+            LastData.CMD_TRM_PWM_DUTY,
+            LastData.CMD_TRM_RESET_OPERATING_MODE,
+        }
+        commands = [LastData(payload) for payload in raw_payloads]
+        controls = [command for command in commands if command.command in control_commands]
+        if not controls:
+            return False
+        if self._gateway_node is None:
+            return True
+        gateway_addresses = {
+            getattr(device, "address", None)
+            for device in getattr(self._gateway_node, "devices", set())
+        }
+        return any(
+            command.address == 0 or command.address not in gateway_addresses
+            for command in controls
+        )
+
+    async def _reconnect(self):
+        await self.disconnect()
+        return await self.connect()
 
     async def _write(self, payloads):
         if not self.connected:

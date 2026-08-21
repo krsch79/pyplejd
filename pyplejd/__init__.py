@@ -49,6 +49,9 @@ class PlejdManager:
         self.cloud = PlejdCloudSite(**self.credentials)
         self.options = {}
         self.connection_monitor = None
+        self.button_events_enabled = True
+        self.reconnect_after_control_write = False
+        self.control_write_flush_delay = 0.12
 
     @property
     def blacklist(self):

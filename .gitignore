@@ -2,9 +2,13 @@
 /*/
 !gitignore
 !README.md
+!CHANGELOG.md
 !LICENSE
 !setup.py
 !setup.cfg
 !pyplejd/
+!tests/
+!tests/**
 **/__pycache__/
+*.py[cod]
 !compiling.md

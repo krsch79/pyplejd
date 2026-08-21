@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 MIN_PY_VERSION = "3.10"
 PACKAGES = find_packages()
-VERSION = "0.21.3"
+VERSION = "0.21.3.post2"
 
 setup(
     name="pyplejd",
@@ -14,7 +14,13 @@ setup(
     license="MIT",
     url="https://github.com/thomasloven/pyplejd",
     download_url=f"https://github.com/thomasloven/pyplejd/archive/v{VERSION}.tar.gz",
-    install_requires=["aiohttp", "bleak", "bleak_retry_connector", "pydantic"],
+    install_requires=[
+        "aiohttp",
+        "bleak",
+        "bleak_retry_connector",
+        "cryptography",
+        "pydantic",
+    ],
     keywords=["plejd", "bluetooth", "homeassistant"],
     python_requires=f">={MIN_PY_VERSION}",
 )
