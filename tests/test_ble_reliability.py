@@ -141,7 +141,7 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(await self.mesh.write(command.hex))
 
-        reconnect.assert_awaited_once()
+        reconnect.assert_awaited_once_with(preserve_availability=True)
         self.assertEqual(self.mesh.diagnostics["command_reconnects"], 1)
 
     async def test_gateway_control_write_does_not_reconnect(self):

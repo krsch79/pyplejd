@@ -11,3 +11,5 @@
   firmware 6.43.x flushes queued commands.
 - Make button-event polling optional and expose non-secret reliability counters.
 - Declare the already-used `cryptography` package as a direct dependency.
+- Preserve Home Assistant availability during the intentional command-flush
+  reconnect, while real transport failures still mark devices unavailable.

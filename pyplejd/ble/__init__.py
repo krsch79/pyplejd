@@ -66,6 +66,7 @@ class PlejdMesh:
         self._fallback_auth_attempts = 0
         self._command_reconnects = 0
         self._write_retries = 0
+        self._suppress_disconnect_notification = False
 
     @property
     def connected(self):
@@ -101,11 +102,15 @@ class PlejdMesh:
     def set_key(self, key: str):
         self._crypto_key = key
 
-    async def disconnect(self):
+    async def disconnect(self, preserve_availability: bool = False):
         client = self._client
         if client is None:
             return False
 
+        previous_suppression = self._suppress_disconnect_notification
+        self._suppress_disconnect_notification = (
+            previous_suppression or preserve_availability
+        )
         try:
             if getattr(client, "is_connected", False):
                 await client.stop_notify(gatt.PLEJD_LASTDATA)
@@ -115,6 +120,7 @@ class PlejdMesh:
             pass
         finally:
             self._mark_disconnected(client)
+            self._suppress_disconnect_notification = previous_suppression
         return True
 
     def _mark_disconnected(self, client: BleakClient | None = None):
@@ -126,9 +132,11 @@ class PlejdMesh:
         self._client = None
         if self._gateway_node:
             self._gateway_node.is_gateway = False
-            self._gateway_node.update()
+            if not self._suppress_disconnect_notification:
+                self._gateway_node.update()
             self._gateway_node = None
-        self.manager.connect_callback(False)
+        if not self._suppress_disconnect_notification:
+            self.manager.connect_callback(False)
 
     async def connect(self):
         async with self._connect_lock:
@@ -319,7 +327,7 @@ class PlejdMesh:
                     getattr(self.manager, "control_write_flush_delay", 0.12)
                 )
                 self._command_reconnects += 1
-                success = await self._reconnect()
+                success = await self._reconnect(preserve_availability=True)
 
             return success
 
@@ -361,8 +369,8 @@ class PlejdMesh:
             for command in controls
         )
 
-    async def _reconnect(self):
-        await self.disconnect()
+    async def _reconnect(self, preserve_availability: bool = False):
+        await self.disconnect(preserve_availability=preserve_availability)
         return await self.connect()
 
     async def _write(self, payloads):
