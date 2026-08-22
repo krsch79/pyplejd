@@ -52,6 +52,7 @@ class PlejdManager:
         self.button_events_enabled = True
         self.route_control_writes_directly = False
         self.reconnect_after_control_write = False
+        self.disconnect_after_direct_control_write = False
         self.control_confirmation_timeout = 1.5
         self.reauthenticate_before_reconnect = True
         self.reauth_confirmation_timeout = 1.0
@@ -140,6 +141,15 @@ class PlejdManager:
 
     def add_mesh_device(self, device, rssi) -> bool:
         return self.mesh.see_device(device, rssi)
+
+    def advertisement_callback(self, address: str) -> bool:
+        """Mark devices on an advertising hardware node available."""
+        hardware = self.hardware.get(address.replace(":", "").upper())
+        if hardware is None:
+            return False
+        for device in hardware.devices:
+            device.set_available(True)
+        return True
 
     async def close_stale(self, device):
         await close_stale_connections(device)

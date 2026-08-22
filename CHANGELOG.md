@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.21.3.post7 - 2026-08-22
+
+- Add an opt-in on-demand direct-control mode that disconnects from the target
+  node after each confirmed command while preserving Home Assistant
+  availability.
+- Mark only the hardware behind a fresh Plejd advertisement available and mark
+  a direct target unavailable when its BLE connection cannot be established.
+- Retry a failed on-demand write against the same target rather than falling
+  back to an unrelated persistent gateway.
+- Expose on-demand disconnects in non-secret reliability diagnostics.
+
 ## 0.21.3.post6 - 2026-08-22
 
 - Route address-specific control writes through a direct authenticated BLE

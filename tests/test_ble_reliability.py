@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from pyplejd import PlejdManager
 from pyplejd.ble import ble_characteristics as gatt
 from pyplejd.ble import LastData, PlejdMesh
 from pyplejd.ble.crypto import encrypt_decrypt
@@ -56,7 +57,7 @@ def make_node(address="001122334455", device_addresses=()):
         rssi=-45,
         bleDevice=SimpleNamespace(address=address, name="Plejd"),
         is_gateway=False,
-        devices=[SimpleNamespace(address=item) for item in device_addresses],
+        devices=[SimpleNamespace(address=item, set_available=Mock()) for item in device_addresses],
     )
     node.update = Mock()
     return node
@@ -213,6 +214,69 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
         disconnect.assert_not_awaited()
         self.assertEqual(self.mesh.diagnostics["direct_control_routes"], 1)
         self.assertEqual(self.mesh.diagnostics["direct_gateway_switches"], 0)
+
+    async def test_on_demand_direct_write_confirms_and_disconnects(self):
+        target = make_node("AABBCCDDEEFF", device_addresses=(2,))
+        client = FakeClient()
+        self.mesh.expect_device(target)
+        self.mesh._gateway_node = target
+        target.is_gateway = True
+        self.mesh._client = client
+        self.manager.route_control_writes_directly = True
+        self.manager.disconnect_after_direct_control_write = True
+        self.manager.control_confirmation_timeout = 1
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        async def write_and_confirm(_payloads):
+            self.mesh._resolve_control_confirmation(2, True)
+            return True
+
+        with (
+            patch.object(self.mesh, "_write", new=AsyncMock(side_effect=write_and_confirm)),
+            patch.object(self.mesh, "poll", new=AsyncMock()) as poll,
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        poll.assert_awaited_once()
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertFalse(self.mesh.connected)
+        self.assertEqual(self.mesh.diagnostics["control_confirmations"], 1)
+        self.assertEqual(self.mesh.diagnostics["on_demand_disconnects"], 1)
+        self.manager.connect_callback.assert_not_called()
+
+    async def test_failed_direct_route_marks_target_hardware_unavailable(self):
+        target = make_node("AABBCCDDEEFF", device_addresses=(2,))
+        self.mesh.expect_device(target)
+        self.manager.route_control_writes_directly = True
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        with patch.object(self.mesh, "connect", new=AsyncMock(return_value=False)):
+            self.assertFalse(await self.mesh.write(command.hex))
+
+        target.devices[0].set_available.assert_called_once_with(False)
+
+    def test_advertisement_marks_only_matching_hardware_available(self):
+        matching = SimpleNamespace(devices=[Mock(), Mock()])
+        other = SimpleNamespace(devices=[Mock()])
+        manager = PlejdManager.__new__(PlejdManager)
+        manager.hardware = {
+            "AABBCCDDEEFF": matching,
+            "001122334455": other,
+        }
+
+        self.assertTrue(manager.advertisement_callback("AA:BB:CC:DD:EE:FF"))
+        for device in matching.devices:
+            device.set_available.assert_called_once_with(True)
+        other.devices[0].set_available.assert_not_called()
+        self.assertFalse(manager.advertisement_callback("FF:FF:FF:FF:FF:FF"))
 
     async def test_non_control_write_does_not_change_gateway(self):
         current = make_node("001122334455", device_addresses=(1,))

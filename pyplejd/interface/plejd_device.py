@@ -96,6 +96,11 @@ class PlejdDevice:
 
         return remover
 
+    @property
+    def state(self):
+        """Return a snapshot of the latest decoded device state."""
+        return self._state.copy()
+
     async def parse_lightlevel(self, data: LightLevel):
         pass
 

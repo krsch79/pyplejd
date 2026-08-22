@@ -4,15 +4,17 @@ Python package for communicating with and controlling [Plejd](https://plejd.com)
 
 ## Kristian reliability fork
 
-Version `0.21.3.post6` is a focused reliability build for Home Assistant 2026.8
+Version `0.21.3.post7` is a focused reliability build for Home Assistant 2026.8
 and Plejd firmware 6.43.x. It uses direct BLE authentication first, validates
 the actual Bleak connection, and can route an address-specific control command
 directly to the Plejd hardware that owns the output. This avoids firmware's
 broken forwarding path where a mesh command can be echoed without changing the
-remote physical output. The selected node remains connected so consecutive dim
-updates do not create a reconnect storm. Persistent gateway preferences still
-control automatic selection, but an explicit control write can temporarily
-connect to a blacklisted target node.
+remote physical output. The companion integration can opt into an on-demand
+mode that confirms each command and then disconnects from the target, avoiding
+the firmware 6.43.3 output oscillation seen with long-lived controller
+connections. Persistent gateway preferences still control automatic selection
+outside that mode, and an explicit control write can temporarily connect to a
+blacklisted target node.
 
 The older non-gateway recovery remains available for commands that cannot be
 mapped to one hardware node. It accepts only a fresh NodeIndexData poll matching

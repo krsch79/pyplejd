@@ -73,6 +73,7 @@ class PlejdMesh:
         self._direct_control_routes = 0
         self._direct_gateway_switches = 0
         self._direct_route_failures = 0
+        self._on_demand_disconnects = 0
         self._suppress_disconnect_notification = False
         self._control_confirmation = None
 
@@ -99,6 +100,7 @@ class PlejdMesh:
             "direct_control_routes": self._direct_control_routes,
             "direct_gateway_switches": self._direct_gateway_switches,
             "direct_route_failures": self._direct_route_failures,
+            "on_demand_disconnects": self._on_demand_disconnects,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -337,17 +339,32 @@ class PlejdMesh:
         ]
 
         async with self._command_lock:
+            direct_target = None
+            direct_on_demand = False
             if getattr(self.manager, "route_control_writes_directly", False):
+                direct_target = self._target_hardware_for_control_write(raw_payloads)
                 route_result = await self._route_control_write_directly(raw_payloads)
                 if route_result is False:
                     return False
+                direct_on_demand = bool(
+                    route_result is True
+                    and direct_target is not None
+                    and getattr(
+                        self.manager,
+                        "disconnect_after_direct_control_write",
+                        False,
+                    )
+                )
             if not self.connected and not await self.connect():
                 return False
             control_write = self._is_non_gateway_control_write(raw_payloads)
+            requires_confirmation = direct_on_demand or (
+                control_write
+                and getattr(self.manager, "reconnect_after_control_write", False)
+            )
             confirmation = (
                 self._start_control_confirmation(raw_payloads)
-                if control_write
-                and getattr(self.manager, "reconnect_after_control_write", False)
+                if requires_confirmation
                 else None
             )
 
@@ -360,19 +377,41 @@ class PlejdMesh:
                     confirmation = None
                     self._write_retries += 1
                     _LOGGER.warning("Retrying Plejd write after reconnect")
-                    if not await self._reconnect():
+                    reconnected = (
+                        await self._reconnect(
+                            preserve_availability=True,
+                            preferred_node=direct_target,
+                        )
+                        if direct_on_demand
+                        else await self._reconnect()
+                    )
+                    if not reconnected:
                         return False
                     confirmation = (
                         self._start_control_confirmation(raw_payloads)
-                        if control_write
-                        and getattr(
-                            self.manager, "reconnect_after_control_write", False
-                        )
+                        if requires_confirmation
                         else None
                     )
                     success = await self._write(
                         self._encrypt_payloads(raw_payloads)
                     )
+
+                if success and direct_on_demand:
+                    await self.poll()
+                    if confirmation is not None:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(confirmation),
+                                timeout=getattr(
+                                    self.manager,
+                                    "control_confirmation_timeout",
+                                    1.5,
+                                ),
+                            )
+                            self._control_confirmations += 1
+                        except asyncio.TimeoutError:
+                            self._confirmation_timeouts += 1
+                    return success
 
                 if (
                     success
@@ -438,6 +477,9 @@ class PlejdMesh:
                 return success
             finally:
                 self._clear_control_confirmation(confirmation)
+                if direct_on_demand and self.connected:
+                    self._on_demand_disconnects += 1
+                    await self.disconnect(preserve_availability=True)
 
     async def _route_control_write_directly(self, raw_payloads) -> bool | None:
         """Connect directly to the hardware addressed by a control command.
@@ -465,6 +507,8 @@ class PlejdMesh:
             return True
 
         self._direct_route_failures += 1
+        for device in getattr(target, "devices", set()):
+            device.set_available(False)
         _CONNECTION_LOG.warning(
             "Could not route control write directly to Plejd node %s",
             target.BLEaddress,
@@ -591,9 +635,13 @@ class PlejdMesh:
         if not future.done():
             future.cancel()
 
-    async def _reconnect(self, preserve_availability: bool = False):
+    async def _reconnect(
+        self,
+        preserve_availability: bool = False,
+        preferred_node: MeshDevice | None = None,
+    ):
         await self.disconnect(preserve_availability=preserve_availability)
-        return await self.connect()
+        return await self.connect(preferred_node=preferred_node)
 
     async def _reauthenticate_current_client(self):
         async with self._ble_lock:
