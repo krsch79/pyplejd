@@ -73,7 +73,6 @@ class PlejdMesh:
         self._direct_control_routes = 0
         self._direct_gateway_switches = 0
         self._direct_route_failures = 0
-        self._fast_remote_control_flushes = 0
         self._suppress_disconnect_notification = False
         self._control_confirmation = None
 
@@ -100,7 +99,6 @@ class PlejdMesh:
             "direct_control_routes": self._direct_control_routes,
             "direct_gateway_switches": self._direct_gateway_switches,
             "direct_route_failures": self._direct_route_failures,
-            "fast_remote_control_flushes": self._fast_remote_control_flushes,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -346,15 +344,10 @@ class PlejdMesh:
             if not self.connected and not await self.connect():
                 return False
             control_write = self._is_non_gateway_control_write(raw_payloads)
-            fast_remote_control_flush = bool(
-                control_write
-                and getattr(self.manager, "fast_remote_control_flush", False)
-            )
             confirmation = (
                 self._start_control_confirmation(raw_payloads)
                 if control_write
                 and getattr(self.manager, "reconnect_after_control_write", False)
-                and not fast_remote_control_flush
                 else None
             )
 
@@ -388,27 +381,6 @@ class PlejdMesh:
                         self.manager, "reconnect_after_control_write", False
                     )
                 ):
-                    if fast_remote_control_flush:
-                        # Plejd firmware 6.43.x buffers mesh commands addressed to
-                        # remote hardware until the authenticated gateway session
-                        # closes. Flush immediately, then reconnect to the same
-                        # central gateway. This makes the physical response fast
-                        # without switching the BLE ingress between target nodes.
-                        gateway = self._gateway_node
-                        await asyncio.sleep(
-                            getattr(
-                                self.manager,
-                                "control_write_flush_delay",
-                                0.05,
-                            )
-                        )
-                        self._command_reconnects += 1
-                        self._fast_remote_control_flushes += 1
-                        return await self._reconnect(
-                            preserve_availability=True,
-                            preferred_node=gateway,
-                        )
-
                     if confirmation is not None:
                         # PLEJD_LASTDATA may echo the exact outgoing control packet
                         # even when firmware has only buffered it. Polling
@@ -619,13 +591,9 @@ class PlejdMesh:
         if not future.done():
             future.cancel()
 
-    async def _reconnect(
-        self,
-        preserve_availability: bool = False,
-        preferred_node: MeshDevice | None = None,
-    ):
+    async def _reconnect(self, preserve_availability: bool = False):
         await self.disconnect(preserve_availability=preserve_availability)
-        return await self.connect(preferred_node=preferred_node)
+        return await self.connect()
 
     async def _reauthenticate_current_client(self):
         async with self._ble_lock:
