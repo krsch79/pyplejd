@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.21.3.post6 - 2026-08-22
+
+- Route address-specific control writes through a direct authenticated BLE
+  connection to the Plejd hardware that owns the target output.
+- Keep the selected target connected for later commands, avoiding reconnects
+  for repeated dim updates to the same light.
+- Allow an explicit direct control route to override the persistent gateway
+  blacklist without changing the saved gateway preferences.
+- Expose direct-route, gateway-switch, and route-failure counters in diagnostics.
+- Retain the post5 physical-state/reconnect path for commands that cannot be
+  mapped safely to one hardware node.
+
 ## 0.21.3.post5 - 2026-08-22
 
 - Never treat a `LastChangedDataVector` control echo as proof that a physical

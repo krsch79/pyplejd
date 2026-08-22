@@ -70,6 +70,9 @@ class PlejdMesh:
         self._confirmation_timeouts = 0
         self._in_place_reauth_attempts = 0
         self._in_place_reauth_successes = 0
+        self._direct_control_routes = 0
+        self._direct_gateway_switches = 0
+        self._direct_route_failures = 0
         self._suppress_disconnect_notification = False
         self._control_confirmation = None
 
@@ -93,6 +96,9 @@ class PlejdMesh:
             "confirmation_timeouts": self._confirmation_timeouts,
             "in_place_reauth_attempts": self._in_place_reauth_attempts,
             "in_place_reauth_successes": self._in_place_reauth_successes,
+            "direct_control_routes": self._direct_control_routes,
+            "direct_gateway_switches": self._direct_gateway_switches,
+            "direct_route_failures": self._direct_route_failures,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -147,9 +153,11 @@ class PlejdMesh:
         if not self._suppress_disconnect_notification:
             self.manager.connect_callback(False)
 
-    async def connect(self):
+    async def connect(self, preferred_node: MeshDevice | None = None):
         async with self._connect_lock:
-            if self.connected:
+            if self.connected and (
+                preferred_node is None or self._gateway_node is preferred_node
+            ):
                 return True
             if self._client is not None:
                 await self.disconnect()
@@ -189,12 +197,25 @@ class PlejdMesh:
                     )
                 await self.manager.lightlevel_callback(levels)
 
-            # Try to connect to nodes in order of decreasing RSSI
-            filtered_nodes = filter(
-                lambda n: n.connectable and n.rssi is not None,
-                self._mesh_devices.values(),
-            )
-            sorted_nodes = sorted(filtered_nodes, key=lambda n: n.rssi, reverse=True)
+            if preferred_node is not None:
+                # An address-specific control write deliberately overrides the
+                # persistent gateway blacklist. The blacklist still controls
+                # normal/automatic gateway selection.
+                sorted_nodes = (
+                    [preferred_node]
+                    if preferred_node.rssi is not None
+                    and preferred_node.bleDevice is not None
+                    else []
+                )
+            else:
+                # Try to connect to nodes in order of decreasing RSSI.
+                filtered_nodes = filter(
+                    lambda n: n.connectable and n.rssi is not None,
+                    self._mesh_devices.values(),
+                )
+                sorted_nodes = sorted(
+                    filtered_nodes, key=lambda n: n.rssi, reverse=True
+                )
 
             if not sorted_nodes:
                 return False
@@ -316,6 +337,10 @@ class PlejdMesh:
         ]
 
         async with self._command_lock:
+            if getattr(self.manager, "route_control_writes_directly", False):
+                route_result = await self._route_control_write_directly(raw_payloads)
+                if route_result is False:
+                    return False
             if not self.connected and not await self.connect():
                 return False
             control_write = self._is_non_gateway_control_write(raw_payloads)
@@ -414,6 +439,61 @@ class PlejdMesh:
             finally:
                 self._clear_control_confirmation(confirmation)
 
+    async def _route_control_write_directly(self, raw_payloads) -> bool | None:
+        """Connect directly to the hardware addressed by a control command.
+
+        Firmware 6.43.x can acknowledge or echo a mesh write without applying it
+        on a remote node. A direct authenticated BLE write to the target hardware
+        avoids that unreliable forwarding path. The connection remains on the
+        selected node so successive dim updates do not reconnect repeatedly.
+        """
+        target = self._target_hardware_for_control_write(raw_payloads)
+        if target is None:
+            return None
+
+        self._direct_control_routes += 1
+        if self.connected and self._gateway_node is target:
+            return True
+
+        _CONNECTION_LOG.info(
+            "Routing control write directly to Plejd node %s", target.BLEaddress
+        )
+        self._direct_gateway_switches += 1
+        if self.connected:
+            await self.disconnect(preserve_availability=True)
+        if await self.connect(preferred_node=target):
+            return True
+
+        self._direct_route_failures += 1
+        _CONNECTION_LOG.warning(
+            "Could not route control write directly to Plejd node %s",
+            target.BLEaddress,
+        )
+        return False
+
+    def _target_hardware_for_control_write(self, raw_payloads):
+        controls = self._control_commands(raw_payloads)
+        if not controls or any(command.address == 0 for command in controls):
+            return None
+
+        targets = []
+        for command in controls:
+            matching_nodes = [
+                node
+                for node in self._mesh_devices.values()
+                if any(
+                    getattr(device, "address", None) == command.address
+                    for device in getattr(node, "devices", set())
+                )
+            ]
+            if len(matching_nodes) != 1:
+                return None
+            targets.append(matching_nodes[0])
+
+        if any(target is not targets[0] for target in targets[1:]):
+            return None
+        return targets[0]
+
     def _encrypt_payloads(self, raw_payloads):
         return [
             encrypt_decrypt(
@@ -425,6 +505,21 @@ class PlejdMesh:
         ]
 
     def _is_non_gateway_control_write(self, raw_payloads) -> bool:
+        controls = self._control_commands(raw_payloads)
+        if not controls:
+            return False
+        if self._gateway_node is None:
+            return True
+        gateway_addresses = {
+            getattr(device, "address", None)
+            for device in getattr(self._gateway_node, "devices", set())
+        }
+        return any(
+            command.address == 0 or command.address not in gateway_addresses
+            for command in controls
+        )
+
+    def _control_commands(self, raw_payloads):
         control_commands = {
             LastData.CMD_SCENE,
             LastData.CMD_GROUP_OUTPUT_STATE,
@@ -438,19 +533,7 @@ class PlejdMesh:
             LastData.CMD_TRM_RESET_OPERATING_MODE,
         }
         commands = [LastData(payload) for payload in raw_payloads]
-        controls = [command for command in commands if command.command in control_commands]
-        if not controls:
-            return False
-        if self._gateway_node is None:
-            return True
-        gateway_addresses = {
-            getattr(device, "address", None)
-            for device in getattr(self._gateway_node, "devices", set())
-        }
-        return any(
-            command.address == 0 or command.address not in gateway_addresses
-            for command in controls
-        )
+        return [command for command in commands if command.command in control_commands]
 
     def _start_control_confirmation(self, raw_payloads):
         state_commands = {

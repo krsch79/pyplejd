@@ -38,6 +38,7 @@ class FakeClient:
 class Manager:
     def __init__(self):
         self.button_events_enabled = False
+        self.route_control_writes_directly = False
         self.reconnect_after_control_write = True
         self.control_confirmation_timeout = 0
         self.reauthenticate_before_reconnect = False
@@ -150,6 +151,106 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         reconnect.assert_awaited_once_with(preserve_availability=True)
         self.assertEqual(self.mesh.diagnostics["command_reconnects"], 1)
+
+    async def test_control_write_switches_directly_to_target_node(self):
+        current = make_node("001122334455", device_addresses=(1,))
+        target = make_node("AABBCCDDEEFF", device_addresses=(2,))
+        target.connectable = False  # Persistent blacklist must not block routing.
+        old_client = FakeClient()
+        new_client = FakeClient()
+        self.mesh.expect_device(current)
+        self.mesh.expect_device(target)
+        self.mesh._gateway_node = current
+        current.is_gateway = True
+        self.mesh._client = old_client
+        self.manager.route_control_writes_directly = True
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        with (
+            patch(
+                "pyplejd.ble.establish_connection",
+                new=AsyncMock(return_value=new_client),
+            ) as establish,
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+            patch.object(self.mesh, "_write", new=AsyncMock(return_value=True)) as write,
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        establish.assert_awaited_once()
+        self.assertIs(establish.await_args.args[1], target.bleDevice)
+        self.assertEqual(old_client.disconnect_calls, 1)
+        self.assertIs(self.mesh._gateway_node, target)
+        write.assert_awaited_once()
+        self.assertEqual(self.mesh.diagnostics["direct_control_routes"], 1)
+        self.assertEqual(self.mesh.diagnostics["direct_gateway_switches"], 1)
+
+    async def test_repeated_control_write_keeps_target_connection(self):
+        target = make_node("AABBCCDDEEFF", device_addresses=(2,))
+        self.mesh.expect_device(target)
+        self.mesh._gateway_node = target
+        target.is_gateway = True
+        self.mesh._client = FakeClient()
+        self.manager.route_control_writes_directly = True
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
+            payload=[1, 128, 128],
+        )
+
+        with (
+            patch.object(self.mesh, "connect", new=AsyncMock()) as connect,
+            patch.object(self.mesh, "disconnect", new=AsyncMock()) as disconnect,
+            patch.object(self.mesh, "_write", new=AsyncMock(return_value=True)),
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        connect.assert_not_awaited()
+        disconnect.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["direct_control_routes"], 1)
+        self.assertEqual(self.mesh.diagnostics["direct_gateway_switches"], 0)
+
+    async def test_non_control_write_does_not_change_gateway(self):
+        current = make_node("001122334455", device_addresses=(1,))
+        self.mesh._gateway_node = current
+        self.mesh._client = FakeClient()
+        self.manager.route_control_writes_directly = True
+        command = LastData(command=LastData.CMD_EVENT_PREPARE)
+
+        with (
+            patch.object(self.mesh, "connect", new=AsyncMock()) as connect,
+            patch.object(self.mesh, "disconnect", new=AsyncMock()) as disconnect,
+            patch.object(self.mesh, "_write", new=AsyncMock(return_value=True)),
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        connect.assert_not_awaited()
+        disconnect.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["direct_control_routes"], 0)
+
+    def test_mixed_known_and_unknown_targets_are_not_directly_routed(self):
+        target = make_node("AABBCCDDEEFF", device_addresses=(2,))
+        self.mesh.expect_device(target)
+        known = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+        unknown = LastData(
+            address=99,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        self.assertIsNone(
+            self.mesh._target_hardware_for_control_write(
+                [bytearray(known.data), bytearray(unknown.data)]
+            )
+        )
 
     async def test_confirmed_non_gateway_write_skips_reconnect(self):
         node = make_node(device_addresses=(1,))

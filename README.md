@@ -4,21 +4,25 @@ Python package for communicating with and controlling [Plejd](https://plejd.com)
 
 ## Kristian reliability fork
 
-Version `0.21.3.post5` is a focused reliability build for Home Assistant 2026.8
+Version `0.21.3.post6` is a focused reliability build for Home Assistant 2026.8
 and Plejd firmware 6.43.x. It uses direct BLE authentication first, validates
-the actual Bleak connection, serializes recovery, and can reconnect after a
-control write to a non-gateway node. The reconnect is intentional: affected
-firmware buffers those commands until the authenticated BLE session closes.
-The reconnect is skipped only when a fresh NodeIndexData poll confirms both the
-requested power state and, for dimming, the requested raw dim level. A matching
-LastChangedDataVector is deliberately ignored as confirmation because firmware
-6.43.x may echo a buffered command without changing the physical output. If the
-poll does not confirm delivery, the existing connection is reauthenticated
-before the slower full reconnect fallback is used.
+the actual Bleak connection, and can route an address-specific control command
+directly to the Plejd hardware that owns the output. This avoids firmware's
+broken forwarding path where a mesh command can be echoed without changing the
+remote physical output. The selected node remains connected so consecutive dim
+updates do not create a reconnect storm. Persistent gateway preferences still
+control automatic selection, but an explicit control write can temporarily
+connect to a blacklisted target node.
 
-The companion `krsch79/hass-plejd` fork enables the non-gateway flush and
-disables active button-event polling to prevent a feedback storm. Keep that
-integration pinned to the exact pyplejd commit used for deployment.
+The older non-gateway recovery remains available for commands that cannot be
+mapped to one hardware node. It accepts only a fresh NodeIndexData poll matching
+both power state and raw dim level; LastChangedDataVector echoes are never used
+as delivery proof.
+
+The companion `krsch79/hass-plejd` fork enables direct control routing and the
+non-gateway fallback, and disables active button-event polling to prevent a
+feedback storm. Keep that integration pinned to the exact pyplejd commit used
+for deployment.
 
 ---
 
