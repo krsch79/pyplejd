@@ -40,6 +40,7 @@ class Manager:
         self.button_events_enabled = False
         self.route_control_writes_directly = False
         self.reconnect_after_control_write = True
+        self.fast_remote_control_flush = False
         self.control_confirmation_timeout = 0
         self.reauthenticate_before_reconnect = False
         self.reauth_confirmation_timeout = 1
@@ -151,6 +152,59 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         reconnect.assert_awaited_once_with(preserve_availability=True)
         self.assertEqual(self.mesh.diagnostics["command_reconnects"], 1)
+
+    async def test_fast_remote_control_flush_reconnects_same_gateway_immediately(self):
+        gateway = make_node(device_addresses=(1,))
+        self.mesh._gateway_node = gateway
+        self.mesh._client = FakeClient()
+        self.manager.fast_remote_control_flush = True
+        self.manager.control_confirmation_timeout = 10
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        with (
+            patch.object(self.mesh, "_write", new=AsyncMock(return_value=True)),
+            patch.object(
+                self.mesh, "_start_control_confirmation", new=Mock()
+            ) as confirmation,
+            patch.object(
+                self.mesh, "_reconnect", new=AsyncMock(return_value=True)
+            ) as reconnect,
+            patch.object(asyncio, "sleep", new=AsyncMock()) as sleep,
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        confirmation.assert_not_called()
+        sleep.assert_awaited_once_with(0)
+        reconnect.assert_awaited_once_with(
+            preserve_availability=True,
+            preferred_node=gateway,
+        )
+        self.assertEqual(self.mesh.diagnostics["command_reconnects"], 1)
+        self.assertEqual(self.mesh.diagnostics["fast_remote_control_flushes"], 1)
+
+    async def test_fast_flush_does_not_reconnect_for_gateway_output(self):
+        gateway = make_node(device_addresses=(1,))
+        self.mesh._gateway_node = gateway
+        self.mesh._client = FakeClient()
+        self.manager.fast_remote_control_flush = True
+        command = LastData(
+            address=1,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        with (
+            patch.object(self.mesh, "_write", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "_reconnect", new=AsyncMock()) as reconnect,
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        reconnect.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["fast_remote_control_flushes"], 0)
 
     async def test_control_write_switches_directly_to_target_node(self):
         current = make_node("001122334455", device_addresses=(1,))
