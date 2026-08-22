@@ -41,6 +41,8 @@ class Manager:
         self.route_control_writes_directly = False
         self.reconnect_after_control_write = True
         self.fast_remote_control_flush = False
+        self.prime_gateway_connection = False
+        self.gateway_prime_delay = 0
         self.control_confirmation_timeout = 0
         self.reauthenticate_before_reconnect = False
         self.reauth_confirmation_timeout = 1
@@ -111,6 +113,36 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(direct_client.disconnect_calls, 1)
         sleep.assert_awaited_once_with(5)
         self.assertEqual(self.mesh.diagnostics["fallback_auth_attempts"], 1)
+
+    async def test_gateway_is_primed_only_on_first_connection(self):
+        node = make_node()
+        priming_client = FakeClient()
+        persistent_client = FakeClient()
+        later_client = FakeClient()
+        self.mesh.expect_device(node)
+        self.manager.prime_gateway_connection = True
+
+        with (
+            patch(
+                "pyplejd.ble.establish_connection",
+                new=AsyncMock(
+                    side_effect=[priming_client, persistent_client, later_client]
+                ),
+            ) as establish,
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+            patch.object(asyncio, "sleep", new=AsyncMock()) as sleep,
+        ):
+            self.assertTrue(await self.mesh.connect())
+            await self.mesh.disconnect(preserve_availability=True)
+            self.assertTrue(await self.mesh.connect(preferred_node=node))
+
+        self.assertEqual(establish.await_count, 3)
+        self.assertEqual(priming_client.disconnect_calls, 1)
+        self.assertEqual(persistent_client.disconnect_calls, 1)
+        sleep.assert_awaited_once_with(0)
+        self.assertEqual(self.mesh.diagnostics["gateway_prime_attempts"], 1)
+        self.assertEqual(self.mesh.diagnostics["gateway_prime_successes"], 1)
 
     async def test_button_event_does_not_request_another_event_when_disabled(self):
         node = make_node()

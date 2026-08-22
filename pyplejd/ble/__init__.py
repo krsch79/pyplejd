@@ -74,6 +74,9 @@ class PlejdMesh:
         self._direct_gateway_switches = 0
         self._direct_route_failures = 0
         self._fast_remote_control_flushes = 0
+        self._gateway_prime_attempts = 0
+        self._gateway_prime_successes = 0
+        self._primed_gateway_addresses = set()
         self._suppress_disconnect_notification = False
         self._control_confirmation = None
 
@@ -101,6 +104,8 @@ class PlejdMesh:
             "direct_gateway_switches": self._direct_gateway_switches,
             "direct_route_failures": self._direct_route_failures,
             "fast_remote_control_flushes": self._fast_remote_control_flushes,
+            "gateway_prime_attempts": self._gateway_prime_attempts,
+            "gateway_prime_successes": self._gateway_prime_successes,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -224,6 +229,7 @@ class PlejdMesh:
             client = None
             for node in sorted_nodes:
                 try:
+                    primed_now = False
                     self._connection_attempts += 1
                     _CONNECTION_LOG.debug("Attempting direct connection to %s", node)
                     client = await establish_connection(
@@ -233,6 +239,34 @@ class PlejdMesh:
                         max_attempts=2,
                     )
                     client.set_disconnected_callback(_disconnect)
+
+                    if (
+                        getattr(self.manager, "prime_gateway_connection", False)
+                        and node.BLEaddress not in self._primed_gateway_addresses
+                    ):
+                        # Firmware 6.43.x can leave a newly selected BLE ingress
+                        # in a mode where only its own output responds and remote
+                        # mesh writes remain buffered. One unauthenticated
+                        # connect/disconnect cycle primes that node, matching the
+                        # firmware workaround validated upstream. Do it only once
+                        # per manager lifetime so routine reconnects do not trigger
+                        # the firmware's aggressive reconnect throttling.
+                        self._gateway_prime_attempts += 1
+                        _CONNECTION_LOG.info(
+                            "Priming Plejd gateway %s before persistent mesh session",
+                            node.BLEaddress,
+                        )
+                        await client.disconnect()
+                        await asyncio.sleep(
+                            getattr(self.manager, "gateway_prime_delay", 5.0)
+                        )
+                        client = await establish_connection(
+                            BleakClientWithServiceCache,
+                            node.bleDevice,
+                            node.bleDevice.name,
+                            _disconnect,
+                        )
+                        primed_now = True
 
                     if await self._authenticate(client):
                         self._direct_auth_successes += 1
@@ -253,6 +287,10 @@ class PlejdMesh:
                         if not await self._authenticate(client):
                             await client.disconnect()
                             continue
+
+                    if primed_now:
+                        self._primed_gateway_addresses.add(node.BLEaddress)
+                        self._gateway_prime_successes += 1
 
                     self._gateway_node = node
                     node.is_gateway = True
