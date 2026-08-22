@@ -14,12 +14,16 @@ class FakeClient:
         self.disconnect_callback = None
         self.notify_callbacks = {}
         self.disconnect_calls = 0
+        self.writes = []
 
     def set_disconnected_callback(self, callback):
         self.disconnect_callback = callback
 
     async def start_notify(self, characteristic, callback):
         self.notify_callbacks[characteristic] = callback
+
+    async def write_gatt_char(self, characteristic, payload, response=True):
+        self.writes.append((characteristic, bytes(payload), response))
 
     async def stop_notify(self, _characteristic):
         return None
@@ -171,6 +175,94 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
         reconnect.assert_not_awaited()
         self.assertEqual(self.mesh.diagnostics["control_confirmations"], 1)
         self.assertEqual(self.mesh.diagnostics["confirmation_timeouts"], 0)
+
+    async def test_lastdata_echo_does_not_confirm_non_gateway_write(self):
+        node = make_node(device_addresses=(1,))
+        client = FakeClient()
+        self.mesh.expect_device(node)
+        self.manager.control_confirmation_timeout = 0
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[1],
+        )
+
+        with (
+            patch("pyplejd.ble.establish_connection", new=AsyncMock(return_value=client)),
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.mesh.connect())
+
+        async def write_and_echo(_payloads):
+            encrypted = encrypt_decrypt(
+                "00" * 16, node.BLEaddress, bytearray(command.data)
+            )
+            await client.notify_callbacks[gatt.PLEJD_LASTDATA](None, encrypted)
+            return True
+
+        with (
+            patch.object(self.mesh, "_write", new=AsyncMock(side_effect=write_and_echo)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+            patch.object(self.mesh, "_reconnect", new=AsyncMock(return_value=True)) as reconnect,
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        reconnect.assert_awaited_once_with(preserve_availability=True)
+        self.assertEqual(self.mesh.diagnostics["control_confirmations"], 0)
+        self.assertEqual(self.mesh.diagnostics["confirmation_timeouts"], 1)
+
+    async def test_lightlevel_requires_matching_dim_level(self):
+        node = make_node(device_addresses=(1,))
+        self.mesh._gateway_node = node
+        self.mesh._client = FakeClient()
+        self.manager.control_confirmation_timeout = 0
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
+            payload=[1, 128, 128],
+        )
+        confirmation = self.mesh._start_control_confirmation([bytearray(command.data)])
+
+        self.mesh._resolve_control_confirmation(2, True, 64 * 257)
+        self.assertFalse(confirmation.done())
+
+        self.mesh._resolve_control_confirmation(2, True, 128 * 257)
+        self.assertTrue(confirmation.done())
+        self.mesh._clear_control_confirmation(confirmation)
+
+    async def test_matching_lightlevel_dim_confirms_without_reconnect(self):
+        node = make_node(device_addresses=(1,))
+        client = FakeClient()
+        self.mesh.expect_device(node)
+        self.manager.control_confirmation_timeout = 1
+        command = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
+            payload=[1, 128, 128],
+        )
+
+        with (
+            patch("pyplejd.ble.establish_connection", new=AsyncMock(return_value=client)),
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.mesh.connect())
+
+        async def write_and_report(_payloads):
+            lightlevel = bytearray([2, 1, 0, 0, 0, 128, 128, 0, 0, 0])
+            await client.notify_callbacks[gatt.PLEJD_LIGHTLEVEL](None, lightlevel)
+            return True
+
+        with (
+            patch.object(self.mesh, "_write", new=AsyncMock(side_effect=write_and_report)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+            patch.object(self.mesh, "_reconnect", new=AsyncMock(return_value=True)) as reconnect,
+        ):
+            self.assertTrue(await self.mesh.write(command.hex))
+
+        reconnect.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["control_confirmations"], 1)
 
     async def test_in_place_reauthentication_can_confirm_without_reconnect(self):
         node = make_node(device_addresses=(1,))

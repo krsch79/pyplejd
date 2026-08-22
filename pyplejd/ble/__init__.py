@@ -169,14 +169,6 @@ class PlejdMesh:
 
                 ld = LastData(data)
                 rec_log(f"lastdata {ld}")
-                if ld.command in {
-                    LastData.CMD_GROUP_OUTPUT_STATE,
-                    LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
-                    LastData.CMD_OUTPUT_STATE_AND_LEVEL,
-                } and ld.payload:
-                    self._resolve_control_confirmation(
-                        ld.address, bool(ld.payload[0])
-                    )
                 await self.manager.lastdata_callback(ld)
 
                 if ld.command == LastData.CMD_EVENT_FIRED and getattr(
@@ -192,7 +184,9 @@ class PlejdMesh:
                 rec_log(f"lightlevel {lightlevel}")
                 levels = parse_lightlevels(lightlevel)
                 for level in levels:
-                    self._resolve_control_confirmation(level.address, level.state)
+                    self._resolve_control_confirmation(
+                        level.address, level.state, level.dim
+                    )
                 await self.manager.lightlevel_callback(levels)
 
             # Try to connect to nodes in order of decreasing RSSI
@@ -363,6 +357,12 @@ class PlejdMesh:
                     )
                 ):
                     if confirmation is not None:
+                        # PLEJD_LASTDATA may echo the exact outgoing control packet
+                        # even when firmware has only buffered it. Polling
+                        # PLEJD_LIGHTLEVEL is the first independent observation of
+                        # the physical state, so only that notification may resolve
+                        # the confirmation future.
+                        await self.poll()
                         try:
                             await asyncio.wait_for(
                                 asyncio.shield(confirmation),
@@ -461,23 +461,40 @@ class PlejdMesh:
         for raw_payload in raw_payloads:
             command = LastData(raw_payload)
             if command.command in state_commands and command.payload:
+                expected_dim = None
+                if (
+                    command.command
+                    in {
+                        LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
+                        LastData.CMD_OUTPUT_STATE_AND_LEVEL,
+                    }
+                    and bool(command.payload[0])
+                    and len(command.payload) >= 3
+                ):
+                    expected_dim = int.from_bytes(
+                        command.payload[1:3], byteorder="little"
+                    )
                 future = asyncio.get_running_loop().create_future()
                 self._control_confirmation = (
                     command.address,
                     bool(command.payload[0]),
+                    expected_dim,
                     future,
                 )
                 return future
         return None
 
-    def _resolve_control_confirmation(self, address: int, state: bool):
+    def _resolve_control_confirmation(
+        self, address: int, state: bool, dim: int | None = None
+    ):
         confirmation = self._control_confirmation
         if confirmation is None:
             return
-        expected_address, expected_state, future = confirmation
+        expected_address, expected_state, expected_dim, future = confirmation
         if (
             address == expected_address
             and bool(state) == expected_state
+            and (expected_dim is None or dim == expected_dim)
             and not future.done()
         ):
             future.set_result(True)
@@ -486,7 +503,7 @@ class PlejdMesh:
         if future is None:
             return
         confirmation = self._control_confirmation
-        if confirmation is not None and confirmation[2] is future:
+        if confirmation is not None and confirmation[3] is future:
             self._control_confirmation = None
         if not future.done():
             future.cancel()

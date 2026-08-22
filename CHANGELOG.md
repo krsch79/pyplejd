@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.21.3.post5 - 2026-08-22
+
+- Never treat a `LastChangedDataVector` control echo as proof that a physical
+  Plejd output changed state.
+- Poll `NodeIndexData` after non-gateway writes and accept only that independent
+  state report as confirmation.
+- Require both power state and raw dim level to match for dimming commands
+  before skipping recovery.
+- Keep in-place reauthentication and a full reconnect as the two fallback
+  stages when the polled physical state does not match.
+
 ## 0.21.3.post4 - 2026-08-21
 
 - Try a fresh Plejd authentication challenge on the existing BLE connection
