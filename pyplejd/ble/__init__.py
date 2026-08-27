@@ -76,6 +76,7 @@ class PlejdMesh:
         self._on_demand_disconnects = 0
         self._ignored_stale_notifications = 0
         self._filtered_cross_node_updates = 0
+        self._filtered_direct_state_echoes = 0
         self._suppress_disconnect_notification = False
         self._control_confirmation = None
 
@@ -105,6 +106,7 @@ class PlejdMesh:
             "on_demand_disconnects": self._on_demand_disconnects,
             "ignored_stale_notifications": self._ignored_stale_notifications,
             "filtered_cross_node_updates": self._filtered_cross_node_updates,
+            "filtered_direct_state_echoes": self._filtered_direct_state_echoes,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -214,12 +216,20 @@ class PlejdMesh:
                 ld = LastData(data)
                 rec_log(f"lastdata {ld}")
                 target_addresses = _direct_target_addresses()
-                if (
-                    target_addresses is not None
-                    and ld.address not in target_addresses
-                ):
-                    self._filtered_cross_node_updates += 1
-                    return
+                if target_addresses is not None:
+                    if ld.address not in target_addresses:
+                        self._filtered_cross_node_updates += 1
+                        return
+                    if ld.command in {
+                        LastData.CMD_GROUP_OUTPUT_STATE,
+                        LastData.CMD_GROUP_OUTPUT_STATE_AND_LEVEL,
+                        LastData.CMD_OUTPUT_STATE_AND_LEVEL,
+                    }:
+                        # Firmware 6.43.3 can replay stale off/on control echoes
+                        # as a direct connection opens. They are not physical
+                        # state evidence; the LightLevel poll below is.
+                        self._filtered_direct_state_echoes += 1
+                        return
                 await self.manager.lastdata_callback(ld)
 
                 if ld.command == LastData.CMD_EVENT_FIRED and getattr(

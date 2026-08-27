@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.21.3.post9 - 2026-08-27
+
+- Ignore state-changing LastData echoes during direct on-demand sessions and
+  use the independently polled LightLevel response as the sole state source.
+- Prevent firmware 6.43.3's reproducible stale `off` then `on` echo sequence
+  from creating false light transitions in Home Assistant and bridge clients.
+- Expose filtered direct state echoes in diagnostics and cover the exact stale
+  target-node echo with a regression test.
+
 ## 0.21.3.post8 - 2026-08-27
 
 - Bind notification handlers to the exact BLE client and Plejd node that

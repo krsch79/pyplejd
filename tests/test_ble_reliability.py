@@ -183,6 +183,32 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.manager.lastdata_callback.assert_not_awaited()
         self.assertEqual(self.mesh.diagnostics["filtered_cross_node_updates"], 1)
 
+    async def test_direct_session_ignores_target_state_echo(self):
+        node = make_node(device_addresses=(2,))
+        client = FakeClient()
+        self.mesh.expect_device(node)
+        self.manager.filter_direct_state_updates = True
+
+        with (
+            patch("pyplejd.ble.establish_connection", new=AsyncMock(return_value=client)),
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.mesh.connect(preferred_node=node))
+
+        stale_off = LastData(
+            address=2,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[0],
+        )
+        encrypted = encrypt_decrypt(
+            "00" * 16, node.BLEaddress, bytearray(stale_off.data)
+        )
+        await client.notify_callbacks[gatt.PLEJD_LASTDATA](None, encrypted)
+
+        self.manager.lastdata_callback.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["filtered_direct_state_echoes"], 1)
+
     async def test_delayed_notification_from_old_direct_session_is_ignored(self):
         first = make_node("001122334455", device_addresses=(1,))
         second = make_node("AABBCCDDEEFF", device_addresses=(2,))
