@@ -53,6 +53,7 @@ class PlejdManager:
         self.route_control_writes_directly = False
         self.reconnect_after_control_write = False
         self.disconnect_after_direct_control_write = False
+        self.filter_direct_state_updates = False
         self.control_confirmation_timeout = 1.5
         self.reauthenticate_before_reconnect = True
         self.reauth_confirmation_timeout = 1.0

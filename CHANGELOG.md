@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.21.3.post8 - 2026-08-27
+
+- Bind notification handlers to the exact BLE client and Plejd node that
+  created them so delayed packets from an old direct session are discarded.
+- In direct on-demand mode, accept state updates only for outputs owned by the
+  connected target hardware and ignore stale broadcast or cross-node updates.
+- Expose discarded stale and cross-node notifications in diagnostics and add
+  regression coverage for rapid consecutive commands to different nodes.
+
 ## 0.21.3.post7 - 2026-08-22
 
 - Add an opt-in on-demand direct-control mode that disconnects from the target

@@ -41,6 +41,7 @@ class Manager:
         self.button_events_enabled = False
         self.route_control_writes_directly = False
         self.reconnect_after_control_write = True
+        self.filter_direct_state_updates = False
         self.control_confirmation_timeout = 0
         self.reauthenticate_before_reconnect = False
         self.reauth_confirmation_timeout = 1
@@ -132,6 +133,83 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager.lastdata_callback.assert_awaited_once()
         poll_buttons.assert_not_awaited()
+
+    async def test_direct_session_filters_cross_node_lightlevels(self):
+        node = make_node(device_addresses=(2,))
+        client = FakeClient()
+        self.mesh.expect_device(node)
+        self.manager.filter_direct_state_updates = True
+
+        with (
+            patch("pyplejd.ble.establish_connection", new=AsyncMock(return_value=client)),
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.mesh.connect(preferred_node=node))
+
+        target = bytearray([2, 1, 0, 0, 0, 128, 128, 0, 0, 0])
+        unrelated = bytearray([3, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        await client.notify_callbacks[gatt.PLEJD_LIGHTLEVEL](
+            None, target + unrelated
+        )
+
+        levels = self.manager.lightlevel_callback.await_args.args[0]
+        self.assertEqual([level.address for level in levels], [2])
+        self.assertEqual(self.mesh.diagnostics["filtered_cross_node_updates"], 1)
+
+    async def test_direct_session_ignores_broadcast_lastdata(self):
+        node = make_node(device_addresses=(2,))
+        client = FakeClient()
+        self.mesh.expect_device(node)
+        self.manager.filter_direct_state_updates = True
+
+        with (
+            patch("pyplejd.ble.establish_connection", new=AsyncMock(return_value=client)),
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.mesh.connect(preferred_node=node))
+
+        broadcast = LastData(
+            address=0,
+            command=LastData.CMD_GROUP_OUTPUT_STATE,
+            payload=[0],
+        )
+        encrypted = encrypt_decrypt(
+            "00" * 16, node.BLEaddress, bytearray(broadcast.data)
+        )
+        await client.notify_callbacks[gatt.PLEJD_LASTDATA](None, encrypted)
+
+        self.manager.lastdata_callback.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["filtered_cross_node_updates"], 1)
+
+    async def test_delayed_notification_from_old_direct_session_is_ignored(self):
+        first = make_node("001122334455", device_addresses=(1,))
+        second = make_node("AABBCCDDEEFF", device_addresses=(2,))
+        first_client = FakeClient()
+        second_client = FakeClient()
+        self.mesh.expect_device(first)
+        self.mesh.expect_device(second)
+
+        with (
+            patch(
+                "pyplejd.ble.establish_connection",
+                new=AsyncMock(side_effect=[first_client, second_client]),
+            ),
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.mesh.connect(preferred_node=first))
+            old_listener = first_client.notify_callbacks[gatt.PLEJD_LIGHTLEVEL]
+            await self.mesh.disconnect(preserve_availability=True)
+            self.assertTrue(await self.mesh.connect(preferred_node=second))
+
+        await old_listener(
+            None, bytearray([1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        )
+
+        self.manager.lightlevel_callback.assert_not_awaited()
+        self.assertEqual(self.mesh.diagnostics["ignored_stale_notifications"], 1)
 
     async def test_non_gateway_control_write_reconnects_once(self):
         node = make_node(device_addresses=(1,))

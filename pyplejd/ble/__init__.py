@@ -74,6 +74,8 @@ class PlejdMesh:
         self._direct_gateway_switches = 0
         self._direct_route_failures = 0
         self._on_demand_disconnects = 0
+        self._ignored_stale_notifications = 0
+        self._filtered_cross_node_updates = 0
         self._suppress_disconnect_notification = False
         self._control_confirmation = None
 
@@ -101,6 +103,8 @@ class PlejdMesh:
             "direct_gateway_switches": self._direct_gateway_switches,
             "direct_route_failures": self._direct_route_failures,
             "on_demand_disconnects": self._on_demand_disconnects,
+            "ignored_stale_notifications": self._ignored_stale_notifications,
+            "filtered_cross_node_updates": self._filtered_cross_node_updates,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -165,20 +169,57 @@ class PlejdMesh:
                 await self.disconnect()
             _CONNECTION_LOG.debug("Trying to connect to BLE mesh")
 
+            # Each connect() invocation owns its notification callbacks. Keep the
+            # exact client and node in the closure so a delayed callback from a
+            # disconnected session cannot be decrypted or applied as if it came
+            # from the next directly connected Plejd node.
+            listener_client = None
+            listener_node = None
+
+            def _notification_is_current() -> bool:
+                current = (
+                    self.connected
+                    and self._client is listener_client
+                    and self._gateway_node is listener_node
+                )
+                if not current:
+                    self._ignored_stale_notifications += 1
+                return current
+
+            def _direct_target_addresses() -> set[int] | None:
+                if not getattr(
+                    self.manager, "filter_direct_state_updates", False
+                ) or listener_node is None:
+                    return None
+                addresses = set()
+                for device in getattr(listener_node, "devices", set()):
+                    for attribute in ("address", "rxAddress"):
+                        address = getattr(device, attribute, None)
+                        if address is not None:
+                            addresses.add(address)
+                return addresses
+
             def _disconnect(client: BleakClient):
                 _CONNECTION_LOG.debug("Disconnected from BLE mesh (%s)", client)
                 self._mark_disconnected(client)
 
             async def _lastdata_listener(_arg, lastdata: bytearray):
-                if not self.connected:
+                if not _notification_is_current():
                     return
 
                 data = encrypt_decrypt(
-                    self._crypto_key, self._gateway_node.BLEaddress, lastdata
+                    self._crypto_key, listener_node.BLEaddress, lastdata
                 )
 
                 ld = LastData(data)
                 rec_log(f"lastdata {ld}")
+                target_addresses = _direct_target_addresses()
+                if (
+                    target_addresses is not None
+                    and ld.address not in target_addresses
+                ):
+                    self._filtered_cross_node_updates += 1
+                    return
                 await self.manager.lastdata_callback(ld)
 
                 if ld.command == LastData.CMD_EVENT_FIRED and getattr(
@@ -188,16 +229,26 @@ class PlejdMesh:
                 return True
 
             async def _lightlevel_listener(_, lightlevel: bytearray):
-                if not self.connected:
+                if not _notification_is_current():
                     return
 
                 rec_log(f"lightlevel {lightlevel}")
                 levels = parse_lightlevels(lightlevel)
+                target_addresses = _direct_target_addresses()
+                if target_addresses is not None:
+                    filtered_levels = [
+                        level for level in levels if level.address in target_addresses
+                    ]
+                    self._filtered_cross_node_updates += len(levels) - len(
+                        filtered_levels
+                    )
+                    levels = filtered_levels
                 for level in levels:
                     self._resolve_control_confirmation(
                         level.address, level.state, level.dim
                     )
-                await self.manager.lightlevel_callback(levels)
+                if levels:
+                    await self.manager.lightlevel_callback(levels)
 
             if preferred_node is not None:
                 # An address-specific control write deliberately overrides the
@@ -258,6 +309,8 @@ class PlejdMesh:
                     node.is_gateway = True
                     self._gateway_node.update()
                     self._client = client
+                    listener_client = client
+                    listener_node = node
                     await client.start_notify(
                         gatt.PLEJD_LASTDATA, _lastdata_listener
                     )
