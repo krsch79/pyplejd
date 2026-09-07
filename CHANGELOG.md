@@ -81,3 +81,10 @@
 - Declare the already-used `cryptography` package as a direct dependency.
 - Preserve Home Assistant availability during the intentional command-flush
   reconnect, while real transport failures still mark devices unavailable.
+# 0.21.3.post10
+
+- Request a 30-50 ms BLE connection interval after authentication so a Plejd
+  gateway retains radio time for mesh relaying. This is based on upstream
+  pyplejd PR #24 and is best-effort when the Bluetooth backend lacks support.
+- Expose successful and failed connection-parameter requests in reliability
+  diagnostics and retain the post9 direct/on-demand fallback implementation.

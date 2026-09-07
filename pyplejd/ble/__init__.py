@@ -21,6 +21,16 @@ from .debug import rec_log
 _LOGGER = logging.getLogger(__name__)
 _CONNECTION_LOG = logging.getLogger("pyplejd.ble.connection")
 
+# Home Assistant's Bluetooth stack normally negotiates a very aggressive
+# connection interval. Plejd hardware has to share the same radio between the
+# GATT connection and its proprietary mesh. Upstream testing in pyplejd PR #24
+# found that intervals below 15 ms can starve mesh relaying and trigger phantom
+# state traffic. Request a conservative 30-50 ms interval after authentication.
+CONN_MIN_INTERVAL = 0x18  # 24 * 1.25 ms = 30 ms
+CONN_MAX_INTERVAL = 0x28  # 40 * 1.25 ms = 50 ms
+CONN_LATENCY = 0
+CONN_TIMEOUT = 800  # 800 * 10 ms = 8 s
+
 
 class MeshDevice:
     BLEaddress: str
@@ -77,6 +87,8 @@ class PlejdMesh:
         self._ignored_stale_notifications = 0
         self._filtered_cross_node_updates = 0
         self._filtered_direct_state_echoes = 0
+        self._connection_param_requests = 0
+        self._connection_param_failures = 0
         self._suppress_disconnect_notification = False
         self._control_confirmation = None
 
@@ -107,6 +119,8 @@ class PlejdMesh:
             "ignored_stale_notifications": self._ignored_stale_notifications,
             "filtered_cross_node_updates": self._filtered_cross_node_updates,
             "filtered_direct_state_echoes": self._filtered_direct_state_echoes,
+            "connection_param_requests": self._connection_param_requests,
+            "connection_param_failures": self._connection_param_failures,
             "button_polling": bool(
                 getattr(self.manager, "button_events_enabled", True)
             ),
@@ -315,6 +329,8 @@ class PlejdMesh:
                             await client.disconnect()
                             continue
 
+                    await self._relax_connection_params(client)
+
                     self._gateway_node = node
                     node.is_gateway = True
                     self._gateway_node.update()
@@ -348,6 +364,35 @@ class PlejdMesh:
                     "Failed to connect to plejd mesh - %s", sorted_nodes
                 )
                 return False
+
+    async def _relax_connection_params(self, client: BleakClient) -> None:
+        """Best-effort request for a mesh-friendly BLE connection interval."""
+        set_params = getattr(client, "set_connection_params", None)
+        if set_params is None:
+            self._connection_param_failures += 1
+            _CONNECTION_LOG.warning(
+                "Plejd BLE connection interval request is unavailable"
+            )
+            return
+        try:
+            await set_params(
+                CONN_MIN_INTERVAL,
+                CONN_MAX_INTERVAL,
+                CONN_LATENCY,
+                CONN_TIMEOUT,
+            )
+        except Exception:
+            self._connection_param_failures += 1
+            _CONNECTION_LOG.warning(
+                "Plejd BLE connection interval request failed", exc_info=True
+            )
+        else:
+            self._connection_param_requests += 1
+            _CONNECTION_LOG.warning(
+                "Plejd BLE connection interval requested: %.2f-%.2f ms",
+                CONN_MIN_INTERVAL * 1.25,
+                CONN_MAX_INTERVAL * 1.25,
+            )
 
     async def poll(self):
         if not self.connected:

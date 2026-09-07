@@ -16,6 +16,7 @@ class FakeClient:
         self.notify_callbacks = {}
         self.disconnect_calls = 0
         self.writes = []
+        self.connection_params = []
 
     def set_disconnected_callback(self, callback):
         self.disconnect_callback = callback
@@ -34,6 +35,13 @@ class FakeClient:
         self.is_connected = False
         if self.disconnect_callback:
             self.disconnect_callback(self)
+
+    async def set_connection_params(
+        self, min_interval, max_interval, latency, timeout
+    ):
+        self.connection_params.append(
+            (min_interval, max_interval, latency, timeout)
+        )
 
 
 class Manager:
@@ -85,7 +93,27 @@ class PlejdMeshReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(establish.await_count, 1)
         self.assertEqual(client.disconnect_calls, 0)
         self.assertEqual(self.mesh.diagnostics["direct_auth_successes"], 1)
+        self.assertEqual(client.connection_params, [(0x18, 0x28, 0, 800)])
+        self.assertEqual(self.mesh.diagnostics["connection_param_requests"], 1)
+        self.assertEqual(self.mesh.diagnostics["connection_param_failures"], 0)
         self.assertTrue(self.mesh.connected)
+
+    async def test_connection_param_failure_does_not_fail_connection(self):
+        node = make_node()
+        client = FakeClient()
+        client.set_connection_params = AsyncMock(side_effect=RuntimeError("no support"))
+        self.mesh.expect_device(node)
+
+        with (
+            patch("pyplejd.ble.establish_connection", new=AsyncMock(return_value=client)),
+            patch.object(self.mesh, "_authenticate", new=AsyncMock(return_value=True)),
+            patch.object(self.mesh, "poll", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.mesh.connect())
+
+        self.assertTrue(self.mesh.connected)
+        self.assertEqual(self.mesh.diagnostics["connection_param_requests"], 0)
+        self.assertEqual(self.mesh.diagnostics["connection_param_failures"], 1)
 
     async def test_failed_direct_authentication_uses_fallback_once(self):
         node = make_node()
